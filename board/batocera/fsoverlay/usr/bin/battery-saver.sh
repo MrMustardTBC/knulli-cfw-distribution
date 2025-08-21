@@ -8,7 +8,7 @@
 #    ##                                           ##  #
 #    ############################################     #
 #    ############################################     #
-# v2.4                                                #
+# v2.5                                                #
 #######################################################
 
 BATTSAVER_DIR="/var/run/battery-saver/"
@@ -38,7 +38,7 @@ cleanup() {
             echo "$BRIGHTNESS" > "/var/run/batocera-brightness"
         fi
 
-        # Restore if exit while inactive but not duriung shutdown process
+        # Restore if exit while inactive but not during shutdown process
         if [[ ! -f /var/run/shutdown.flag ]]; then
             if [[ "$MODE" == "dim" ]]; then
                 batocera-brightness "$BRIGHTNESS"
@@ -49,6 +49,11 @@ cleanup() {
             batocera-audio setSystemVolume unmute
             echo "1" > "$STATE_FLAG"
         fi
+    fi
+
+    # Clear any pending wakealarm
+    if [ -e "/sys/class/rtc/rtc0/wakealarm" ]; then
+        echo 0 > /sys/class/rtc/rtc0/wakealarm
     fi
 
     rm -f "$LOCK"
@@ -94,6 +99,13 @@ initialize_settings() {
     if [[ -z "$AGGRESSIVE" || ! "$AGGRESSIVE" =~ ^(1|0)$ ]]; then
         AGGRESSIVE="0" # default
         /usr/bin/batocera-settings-set system.batterysaver.aggressive "$AGGRESSIVE"
+    fi
+
+    # Add new setting for suspend-to-shutdown timer
+    SUSPEND_SHUTDOWN_TIMER="$(/usr/bin/batocera-settings-get system.batterysaver.suspendshutdown)"
+    if [[ -z "$SUSPEND_SHUTDOWN_TIMER" || ! "$SUSPEND_SHUTDOWN_TIMER" =~ ^(-2|-1|[0-9]+)$ ]]; then
+        SUSPEND_SHUTDOWN_TIMER="-1" # default: -2=disabled, -1=suspend only, >0=seconds until shutdown
+        /usr/bin/batocera-settings-set system.batterysaver.suspendshutdown "$SUSPEND_SHUTDOWN_TIMER"
     fi
 }
 
@@ -166,8 +178,41 @@ do_inactivity() {
             batocera-brightness dispoff
         ;;
         suspend)
-            pm-is-supported --suspend && pm-suspend
-            do_activity
+            case "$SUSPEND_SHUTDOWN_TIMER" in
+                -2) # Disabled
+                    pm-is-supported --suspend && pm-suspend
+                    do_activity
+                    ;;
+                -1) # Regular suspend
+                    pm-is-supported --suspend && pm-suspend
+                    do_activity
+                    ;;
+                *)  # Suspend then shutdown after timer
+                    # Create a temporary wakealarm if supported
+                    if [ -e "/sys/class/rtc/rtc0/wakealarm" ]; then
+                        CURRENT_TIME=$(date +%s)
+                        WAKE_TIME=$((CURRENT_TIME + SUSPEND_SHUTDOWN_TIMER))
+                        echo 0 > /sys/class/rtc/rtc0/wakealarm
+                        echo "$WAKE_TIME" > /sys/class/rtc/rtc0/wakealarm
+                    fi
+                    
+                    pm-is-supported --suspend && pm-suspend
+                    
+                    # After wake, check if we should shutdown
+                    if [ -e "/sys/class/rtc/rtc0/wakealarm" ]; then
+                        CURRENT_TIME=$(date +%s)
+                        if [ "$CURRENT_TIME" -ge "$WAKE_TIME" ]; then
+                            knulli-shutdown -s
+                        else
+                            # Clear the wakealarm
+                            echo 0 > /sys/class/rtc/rtc0/wakealarm
+                            do_activity
+                        fi
+                    else
+                        do_activity
+                    fi
+                    ;;
+            esac
         ;;
         shutdown)
             knulli-shutdown -s
